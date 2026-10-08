@@ -1,0 +1,7 @@
+.coremark/
+.zig/
+dist/
+coremark-*.zip
+coremark-*.tar.gz
+coremark-*.sha256
+run.log

@@ -1,5 +1,18 @@
-```bash
 #!/usr/bin/env bash
+#
+# Cross-compile CoreMark with Zig and package the result.
+#
+# Everything the build needs (Zig toolchain, packaging tools, optional Zig cache
+# reuse) is handled by this script, so CI only has to run:
+#
+#     bash build-musl.sh
+#
+# Environment overrides:
+#   TARGET        rust-style target triple (default aarch64-unknown-linux-musl)
+#   ZIG_VERSION   pinned Zig version; default is the latest stable release
+#   COREMARK_REF  coremark git ref (default master)
+#   ITERATIONS    CoreMark iterations define (default 0 = auto)
+#
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,9 +22,12 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ------------------------------------------------------------
 
 TARGET="${TARGET:-aarch64-unknown-linux-musl}"
-ZIG_VERSION="${ZIG_VERSION:-0.15.2}"
+ZIG_VERSION="${ZIG_VERSION:-}"
 COREMARK_REF="${COREMARK_REF:-master}"
 ITERATIONS="${ITERATIONS:-0}"
+
+# Bump when the layout/content of the cached Zig directory changes.
+ZIG_CACHE_VERSION="1"
 
 # aarch64-unknown-linux-musl -> aarch64-linux-musl
 case "$TARGET" in
@@ -28,46 +44,210 @@ DIST_DIR="$ROOT_DIR/dist"
 BINARY_NAME="coremark-${TARGET}"
 BINARY="$DIST_DIR/$BINARY_NAME"
 ZIP="$ROOT_DIR/${BINARY_NAME}.zip"
+TARBALL="$ROOT_DIR/${BINARY_NAME}.tar.gz"
+SHAFILE="$ROOT_DIR/${BINARY_NAME}.sha256"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ------------------------------------------------------------
+# Host detection
+# ------------------------------------------------------------
+
+case "$(uname -s)" in
+    Linux)  HOST_OS="linux" ;;
+    Darwin) HOST_OS="macos" ;;
+    *) echo "unsupported host OS: $(uname -s) (use WSL or Linux/macOS)" >&2; exit 1 ;;
+esac
+
+case "$(uname -m)" in
+    x86_64|amd64)  HOST_ARCH="x86_64" ;;
+    aarch64|arm64) HOST_ARCH="aarch64" ;;
+    *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;;
+esac
+
+# ------------------------------------------------------------
+# Tool installation (no-op when everything is already present)
+# ------------------------------------------------------------
+
+install_packages() {
+    local pkgs=("$@") sudo=()
+
+    if [[ "$(id -u)" != "0" ]] && have sudo; then
+        sudo=(sudo)
+    fi
+
+    if have apt-get; then
+        "${sudo[@]:-}" apt-get update -qq
+        "${sudo[@]:-}" apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
+    elif have apk; then
+        "${sudo[@]:-}" apk add --no-cache "${pkgs[@]}"
+    elif have dnf; then
+        "${sudo[@]:-}" dnf install -y "${pkgs[@]}"
+    elif have yum; then
+        "${sudo[@]:-}" yum install -y "${pkgs[@]}"
+    else
+        echo "no supported package manager; please install: ${pkgs[*]}" >&2
+        return 1
+    fi
+}
+
+# Tools needed to download/unpack and to package the result.
+missing=()
+for tool in curl tar zip; do
+    have "$tool" || missing+=("$tool")
+done
+
+if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "==> Installing missing tools: ${missing[*]}"
+    install_packages "${missing[@]}"
+fi
+
+# Verification tools are optional, install them best-effort.
+if ! have readelf || ! have file; then
+    install_packages file binutils || true
+fi
+
+# ------------------------------------------------------------
+# Resolve the Zig version (latest stable unless pinned)
+# ------------------------------------------------------------
+
+if [[ -z "$ZIG_VERSION" ]]; then
+    echo "==> Resolving latest stable Zig"
+
+    # The index is emitted newest-first, so the first release-looking key wins.
+    ZIG_VERSION="$(
+        curl -fsSL --retry 3 https://ziglang.org/download/index.json 2>/dev/null \
+            | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"[[:space:]]*:' \
+            | head -n1 \
+            | tr -dc '0-9.'
+    )" || true
+
+    if [[ -z "$ZIG_VERSION" ]]; then
+        ZIG_VERSION="0.17.0"
+        echo "==> Could not query ziglang.org, falling back to Zig $ZIG_VERSION"
+    fi
+fi
+
+ZIG="$ZIG_DIR/zig"
+
+# ------------------------------------------------------------
+# GitHub Actions cache (best-effort; silently skipped elsewhere)
+# ------------------------------------------------------------
+
+cache_enabled() {
+    [[ -n "${ACTIONS_CACHE_URL:-}" && -n "${ACTIONS_RUNTIME_TOKEN:-}" ]]
+}
+
+cache_key() {
+    echo "zig-${HOST_OS}-${HOST_ARCH}-${ZIG_VERSION}"
+}
+
+cache_restore() {
+    cache_enabled || return 1
+    have tar || return 1
+
+    local base="${ACTIONS_CACHE_URL%/}" key location response
+    key="$(cache_key)"
+
+    response="$(
+        curl -fsS \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            "$base/_apis/artifactcache/cache?keys=$key&version=$ZIG_CACHE_VERSION"
+    )" || return 1
+
+    location="$(printf '%s' "$response" \
+        | grep -o '"archiveLocation":"[^"]*"' | head -n1 | cut -d'"' -f4)"
+
+    [[ -n "$location" ]] || return 1
+
+    mkdir -p "$ZIG_DIR"
+    curl -fsSL \
+        -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+        "$location" -o "$ZIG_DIR/cache.tar" || return 1
+
+    tar -xf "$ZIG_DIR/cache.tar" -C "$ZIG_DIR"
+    rm -f "$ZIG_DIR/cache.tar"
+}
+
+cache_save() {
+    cache_enabled || return 0
+
+    local base="${ACTIONS_CACHE_URL%/}" key id size tmp
+    key="$(cache_key)"
+    tmp="$(mktemp -d)"
+
+    # Reserve the key first; an existing entry returns a non-zero status and the
+    # archive is then never built.
+    id="$(
+        curl -fsS -X POST \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -H "Content-Type: application/json" \
+            --data "{\"key\":\"$key\",\"version\":\"$ZIG_CACHE_VERSION\",\"cacheSize\":0}" \
+            "$base/_apis/artifactcache/caches" \
+            | grep -o '"cacheId":[0-9]*' | cut -d: -f2
+    )" || { rm -rf "$tmp"; return 0; }
+
+    if [[ -z "$id" ]]; then
+        rm -rf "$tmp"
+        return 0
+    fi
+
+    tar -cf "$tmp/zig.tar" -C "$ZIG_DIR" .
+    size="$(wc -c < "$tmp/zig.tar" | tr -d '[:space:]')"
+
+    if curl -fsS -X PATCH \
+        -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+        -H "Content-Type: application/octet-stream" \
+        -H "Content-Range: bytes 0-$((size - 1))/$size" \
+        --data-binary @"$tmp/zig.tar" \
+        "$base/_apis/artifactcache/caches/$id"; then
+        curl -fsS -X POST \
+            -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
+            -H "Accept: application/json;api-version=6.0-preview.1" \
+            -H "Content-Type: application/json" \
+            --data "{\"size\":$size}" \
+            "$base/_apis/artifactcache/caches/$id" || true
+    fi
+
+    rm -rf "$tmp"
+}
 
 # ------------------------------------------------------------
 # Install Zig
 # ------------------------------------------------------------
 
-if [[ ! -x "$ZIG_DIR/zig" ]]; then
-    case "$(uname -s)" in
-        Linux)  HOST_OS="linux" ;;
-        Darwin) HOST_OS="macos" ;;
-        *) echo "unsupported host OS: $(uname -s)" >&2; exit 1 ;;
-    esac
-
-    case "$(uname -m)" in
-        x86_64|amd64)  HOST_ARCH="x86_64" ;;
-        aarch64|arm64) HOST_ARCH="aarch64" ;;
-        *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;;
-    esac
-
-    # Zig >= 0.14 uses zig-<arch>-<os>-<version>
-    ZIG_TARBALL="zig-${HOST_ARCH}-${HOST_OS}-${ZIG_VERSION}.tar.xz"
-    ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
-
-    echo "==> Downloading Zig $ZIG_VERSION ($HOST_ARCH-$HOST_OS)"
-
+if [[ ! -x "$ZIG" ]]; then
     mkdir -p "$ZIG_DIR"
 
-    curl -fL --retry 3 --retry-delay 2 \
-        "$ZIG_URL" \
-        -o "$ZIG_DIR/zig.tar.xz"
+    if cache_restore; then
+        ZIG_FROM_CACHE=1
+        echo "==> Restored Zig $ZIG_VERSION from the GitHub Actions cache"
+    else
+        ZIG_TARBALL="zig-${HOST_ARCH}-${HOST_OS}-${ZIG_VERSION}.tar.xz"
+        ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
 
-    tar -xf "$ZIG_DIR/zig.tar.xz" \
-        -C "$ZIG_DIR" \
-        --strip-components=1
-
-    rm -f "$ZIG_DIR/zig.tar.xz"
+        echo "==> Downloading Zig $ZIG_VERSION ($HOST_ARCH-$HOST_OS)"
+        curl -fL --retry 3 --retry-delay 2 \
+            "$ZIG_URL" -o "$ZIG_DIR/zig.tar.xz"
+        tar -xf "$ZIG_DIR/zig.tar.xz" -C "$ZIG_DIR" --strip-components=1
+        rm -f "$ZIG_DIR/zig.tar.xz"
+    fi
 fi
 
-ZIG="$ZIG_DIR/zig"
+if [[ ! -x "$ZIG" ]]; then
+    echo "Zig is missing at $ZIG" >&2
+    exit 1
+fi
 
 echo "==> Zig $("$ZIG" version)"
+
+# Persist a freshly installed toolchain for the next run (no-op outside
+# GitHub Actions, and skipped when this run already came from the cache).
+if [[ "${ZIG_FROM_CACHE:-0}" != "1" ]]; then
+    cache_save
+fi
 
 # ------------------------------------------------------------
 # Download CoreMark
@@ -95,11 +275,12 @@ echo "========================================"
 echo "Building CoreMark"
 echo "========================================"
 echo "Target: $TARGET"
+echo "Zig:    $("$ZIG" version)"
 echo "========================================"
 
 cd "$COREMARK_DIR"
 
-# coremark.h/COMPILER_FLAGS expands FLAGS_STR, so it must always be defined.
+# coremark.h expands COMPILER_FLAGS to FLAGS_STR, so it must always be defined.
 FLAGS_STR="zig cc -target $ZIG_TARGET -O2 -static"
 
 CFLAGS=(
@@ -134,12 +315,12 @@ chmod +x "$BINARY"
 echo
 echo "==> Binary"
 
-if command -v file >/dev/null 2>&1; then
+if have file; then
     file "$BINARY"
 fi
 
 # Fail the build instead of shipping a wrong-architecture binary.
-if command -v readelf >/dev/null 2>&1; then
+if have readelf; then
     echo
     echo "==> ELF"
 
@@ -175,18 +356,18 @@ fi
 echo
 echo "==> Creating package"
 
-rm -f "$ZIP" "$ROOT_DIR/${BINARY_NAME}.tar.gz"
+rm -f "$ZIP" "$TARBALL" "$SHAFILE"
 
 (
     cd "$DIST_DIR"
     zip -9 "$ZIP" "$BINARY_NAME"
-    tar -czf "$ROOT_DIR/${BINARY_NAME}.tar.gz" "$BINARY_NAME"
+    tar -czf "$TARBALL" "$BINARY_NAME"
 )
 
 (
     cd "$ROOT_DIR"
-    sha256sum "${BINARY_NAME}.zip" "${BINARY_NAME}.tar.gz" \
-        > "${BINARY_NAME}.sha256"
+    sha256sum "$(basename "$ZIP")" "$(basename "$TARBALL")" \
+        > "$(basename "$SHAFILE")"
 )
 
 echo
@@ -199,10 +380,7 @@ echo "  $BINARY"
 echo
 echo "Package:"
 echo "  $ZIP"
-echo "  $ROOT_DIR/${BINARY_NAME}.tar.gz"
+echo "  $TARBALL"
 echo
 echo "Checksum:"
-echo "  $ROOT_DIR/${BINARY_NAME}.sha256"
-echo
-echo "Smoke test on the target machine:"
-echo "  ./$BINARY_NAME 0x0 0x0 0x66"
+echo "  $SHAFILE"

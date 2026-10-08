@@ -22,16 +22,24 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     name: build-${{ matrix.target }}
     steps:
       - uses: actions/checkout@v4
-      - name: build-musl
-        run: |
-          bash build-musl.sh
+
+      # Zig, the packaging tools and the toolchain cache are all handled by the
+      # script itself (it talks to the Actions cache API via ACTIONS_CACHE_URL).
+      - name: Build ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash build-musl.sh
+
       - name: release
+        if: github.event_name != 'pull_request'
         uses: ncipollo/release-action@v1
         with:
           artifacts: "*.zip"
