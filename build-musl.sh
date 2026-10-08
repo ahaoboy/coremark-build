@@ -10,9 +10,11 @@
 # Environment overrides:
 #   TARGET        rust-style target triple (default aarch64-unknown-linux-musl)
 #   ZIG_VERSION   pinned Zig version; default is the latest stable release
-#   COREMARK_REF  coremark git ref (default master)
+#   COREMARK_REF  coremark git ref (default main)
 #   ITERATIONS    CoreMark iterations define (default 0 = auto)
 #
+
+set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -22,7 +24,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 TARGET="${TARGET:-aarch64-unknown-linux-musl}"
 ZIG_VERSION="${ZIG_VERSION:-}"
-COREMARK_REF="${COREMARK_REF:-master}"
+COREMARK_REF="${COREMARK_REF:-main}"
 ITERATIONS="${ITERATIONS:-0}"
 
 # Bump when the layout/content of the cached Zig directory changes.
@@ -55,7 +57,8 @@ have() { command -v "$1" >/dev/null 2>&1; }
 case "$(uname -s)" in
     Linux)  HOST_OS="linux" ;;
     Darwin) HOST_OS="macos" ;;
-    *) echo "unsupported host OS: $(uname -s) (use WSL or Linux/macOS)" >&2; exit 1 ;;
+    MINGW*|MSYS*|CYGWIN*) HOST_OS="windows" ;;
+    *) echo "unsupported host OS: $(uname -s)" >&2; exit 1 ;;
 esac
 
 case "$(uname -m)" in
@@ -63,6 +66,12 @@ case "$(uname -m)" in
     aarch64|arm64) HOST_ARCH="aarch64" ;;
     *) echo "unsupported host arch: $(uname -m)" >&2; exit 1 ;;
 esac
+
+if [[ "$HOST_OS" == "windows" ]]; then
+    ZIG="$ZIG_DIR/zig.exe"
+else
+    ZIG="$ZIG_DIR/zig"
+fi
 
 # ------------------------------------------------------------
 # Tool installation (no-op when everything is already present)
@@ -80,6 +89,8 @@ install_packages() {
         "${sudo[@]:-}" apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
     elif have apk; then
         "${sudo[@]:-}" apk add --no-cache "${pkgs[@]}"
+    elif have pacman; then
+        "${sudo[@]:-}" pacman -S --noconfirm --needed "${pkgs[@]}"
     elif have dnf; then
         "${sudo[@]:-}" dnf install -y "${pkgs[@]}"
     elif have yum; then
@@ -91,8 +102,11 @@ install_packages() {
 }
 
 # Tools needed to download/unpack and to package the result.
+REQUIRED_TOOLS=(curl tar zip)
+[[ "$HOST_OS" == "windows" ]] && REQUIRED_TOOLS+=(unzip)
+
 missing=()
-for tool in curl tar zip; do
+for tool in "${REQUIRED_TOOLS[@]}"; do
     have "$tool" || missing+=("$tool")
 done
 
@@ -126,8 +140,6 @@ if [[ -z "$ZIG_VERSION" ]]; then
         echo "==> Could not query ziglang.org, falling back to Zig $ZIG_VERSION"
     fi
 fi
-
-ZIG="$ZIG_DIR/zig"
 
 # ------------------------------------------------------------
 # GitHub Actions cache (best-effort; silently skipped elsewhere)
@@ -178,12 +190,18 @@ cache_save() {
 
     # Reserve the key first; an existing entry returns a non-zero status and the
     # archive is then never built.
+    size=0
+    if have du; then
+        size="$(du -sb "$ZIG_DIR" 2>/dev/null | cut -f1)"
+        [[ -n "$size" ]] || size=0
+    fi
+
     id="$(
         curl -fsS -X POST \
             -H "Authorization: Bearer $ACTIONS_RUNTIME_TOKEN" \
             -H "Accept: application/json;api-version=6.0-preview.1" \
             -H "Content-Type: application/json" \
-            --data "{\"key\":\"$key\",\"version\":\"$ZIG_CACHE_VERSION\",\"cacheSize\":0}" \
+            --data "{\"key\":\"$key\",\"version\":\"$ZIG_CACHE_VERSION\",\"cacheSize\":$size}" \
             "$base/_apis/artifactcache/caches" \
             | grep -o '"cacheId":[0-9]*' | cut -d: -f2
     )" || { rm -rf "$tmp"; return 0; }
@@ -223,6 +241,19 @@ if [[ ! -x "$ZIG" ]]; then
     if cache_restore; then
         ZIG_FROM_CACHE=1
         echo "==> Restored Zig $ZIG_VERSION from the GitHub Actions cache"
+    elif [[ "$HOST_OS" == "windows" ]]; then
+        ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/zig-${HOST_ARCH}-windows-${ZIG_VERSION}.zip"
+
+        echo "==> Downloading Zig $ZIG_VERSION ($HOST_ARCH-$HOST_OS)"
+        curl -fL --retry 3 --retry-delay 2 \
+            "$ZIG_URL" -o "$ZIG_DIR/zig.zip"
+
+        mkdir -p "$ZIG_DIR/.extract"
+        unzip -q "$ZIG_DIR/zig.zip" -d "$ZIG_DIR/.extract"
+
+        inner="$(find "$ZIG_DIR/.extract" -mindepth 1 -maxdepth 1 -type d | head -n1)"
+        mv "$inner"/* "$ZIG_DIR"/
+        rm -rf "$ZIG_DIR/.extract" "$ZIG_DIR/zig.zip"
     else
         ZIG_TARBALL="zig-${HOST_ARCH}-${HOST_OS}-${ZIG_VERSION}.tar.xz"
         ZIG_URL="https://ziglang.org/download/${ZIG_VERSION}/${ZIG_TARBALL}"
@@ -255,11 +286,19 @@ fi
 if [[ ! -d "$COREMARK_DIR/.git" ]]; then
     echo "==> Downloading CoreMark ($COREMARK_REF)"
 
+    # Drop a stale/partial checkout so the clone cannot fail on the target dir.
+    rm -rf "$COREMARK_DIR"
+
     git clone \
         --depth=1 \
         --branch "$COREMARK_REF" \
         https://github.com/eembc/coremark.git \
         "$COREMARK_DIR"
+fi
+
+if [[ ! -f "$COREMARK_DIR/core_main.c" ]]; then
+    echo "ERROR: CoreMark sources are missing in $COREMARK_DIR" >&2
+    exit 1
 fi
 
 # ------------------------------------------------------------
