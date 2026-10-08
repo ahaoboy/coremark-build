@@ -42,11 +42,15 @@ COREMARK_DIR="$ROOT_DIR/.coremark"
 ZIG_DIR="$ROOT_DIR/.zig"
 DIST_DIR="$ROOT_DIR/dist"
 
-BINARY_NAME="coremark-${TARGET}"
+# The executable inside the archives is always named "coremark"; the archives
+# and checksum file carry the target triple.
+BINARY_NAME="coremark"
+PACKAGE_NAME="coremark-${TARGET}"
+
 BINARY="$DIST_DIR/$BINARY_NAME"
-ZIP="$ROOT_DIR/${BINARY_NAME}.zip"
-TARBALL="$ROOT_DIR/${BINARY_NAME}.tar.gz"
-SHAFILE="$ROOT_DIR/${BINARY_NAME}.sha256"
+ZIP="$ROOT_DIR/${PACKAGE_NAME}.zip"
+TARBALL="$ROOT_DIR/${PACKAGE_NAME}.tar.gz"
+SHAFILE="$ROOT_DIR/${PACKAGE_NAME}.sha256"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -77,24 +81,29 @@ fi
 # Tool installation (no-op when everything is already present)
 # ------------------------------------------------------------
 
-install_packages() {
-    local pkgs=("$@") sudo=()
-
+# Run a command as root when the current user is not root and sudo exists.
+run_privileged() {
     if [[ "$(id -u)" != "0" ]] && have sudo; then
-        sudo=(sudo)
+        sudo "$@"
+    else
+        "$@"
     fi
+}
+
+install_packages() {
+    local pkgs=("$@")
 
     if have apt-get; then
-        "${sudo[@]:-}" apt-get update -qq
-        "${sudo[@]:-}" apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
+        run_privileged apt-get update -qq
+        run_privileged apt-get install -y -qq --no-install-recommends "${pkgs[@]}"
     elif have apk; then
-        "${sudo[@]:-}" apk add --no-cache "${pkgs[@]}"
+        run_privileged apk add --no-cache "${pkgs[@]}"
     elif have pacman; then
-        "${sudo[@]:-}" pacman -S --noconfirm --needed "${pkgs[@]}"
+        run_privileged pacman -S --noconfirm --needed "${pkgs[@]}"
     elif have dnf; then
-        "${sudo[@]:-}" dnf install -y "${pkgs[@]}"
+        run_privileged dnf install -y "${pkgs[@]}"
     elif have yum; then
-        "${sudo[@]:-}" yum install -y "${pkgs[@]}"
+        run_privileged yum install -y "${pkgs[@]}"
     else
         echo "no supported package manager; please install: ${pkgs[*]}" >&2
         return 1
