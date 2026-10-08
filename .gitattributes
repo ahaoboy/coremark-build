@@ -1,0 +1,2 @@
+# Shell scripts must keep LF endings: a CRLF shebang/script breaks bash in CI.
+*.sh text eol=lf
