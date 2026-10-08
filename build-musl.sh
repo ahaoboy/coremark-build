@@ -13,7 +13,6 @@
 #   COREMARK_REF  coremark git ref (default master)
 #   ITERATIONS    CoreMark iterations define (default 0 = auto)
 #
-set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
