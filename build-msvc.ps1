@@ -34,11 +34,9 @@ $DistDir = Join-Path $RootDir 'dist'
 # The executable inside the archive is always named "coremark"; the archive and
 # checksum file carry the target label.
 $BinaryName = 'coremark.exe'
-$RunnerName = 'run.bat'
 $PackageName = "coremark-$Target"
 
 $Binary = Join-Path $DistDir $BinaryName
-$Runner = Join-Path $DistDir $RunnerName
 $Zip = Join-Path $RootDir "$PackageName.zip"
 $ShaFile = Join-Path $RootDir "$PackageName.sha256"
 
@@ -352,24 +350,13 @@ if ($subsystem -ne 3) {
 Write-Host ''
 Write-Host '==> Creating package'
 
-# A BOM keeps cmd.exe from mangling the first line on non-English code pages.
-$runnerText = @(
-    '@echo off'
-    'setlocal'
-    'cd /d "%~dp0"'
-    "$BinaryName 0x0 0x0 0x66 %COREMARK_ITERATIONS%"
-    'pause'
-) -join "`r`n"
-
-[System.IO.File]::WriteAllText($Runner, $runnerText, (New-Object System.Text.UTF8Encoding($true)))
-
 foreach ($path in @($Zip, $ShaFile)) {
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force
     }
 }
 
-Compress-Archive -Path $Binary, $Runner -DestinationPath $Zip -Force
+Compress-Archive -Path $Binary -DestinationPath $Zip -Force
 
 $hash = (Get-FileHash -LiteralPath $Zip -Algorithm SHA256).Hash.ToLowerInvariant()
 "$hash  $PackageName.zip" | Set-Content -LiteralPath $ShaFile -Encoding ASCII
