@@ -30,9 +30,6 @@ jobs:
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     name: build-${{ matrix.target }}
-    concurrency:
-      group: nightly-release
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -63,15 +60,12 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
     name: build-${{ matrix.target }}
-    concurrency:
-      group: nightly-release
-      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
       # The MSVC environment is set up by the script itself (vswhere + vcvars64).
       - name: Build ${{ matrix.target }}
-        shell: pwsh
+        shell: powershell
         env:
           TARGET: ${{ matrix.target }}
         run: ./build-msvc.ps1
