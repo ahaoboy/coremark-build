@@ -17,6 +17,8 @@ defaults:
     shell: bash --noprofile --norc -CeEuo pipefail {0}
 
 jobs:
+  # Each job publishes its own package to the same "nightly" release, so they
+  # share a concurrency group to avoid racing on the release creation.
   build:
     strategy:
       fail-fast: false
@@ -28,6 +30,9 @@ jobs:
             os: ubuntu-latest
     runs-on: ${{ matrix.os }}
     name: build-${{ matrix.target }}
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +42,39 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: bash build-musl.sh
+
+      - name: release
+        if: github.event_name != 'pull_request'
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "*.zip"
+          allowUpdates: true
+          tag: "nightly"
+          name: "nightly"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit: main
+          replacesArtifacts: true
+
+  build-msvc:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+    name: build-${{ matrix.target }}
+    concurrency:
+      group: nightly-release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # The MSVC environment is set up by the script itself (vswhere + vcvars64).
+      - name: Build ${{ matrix.target }}
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./build-msvc.ps1
 
       - name: release
         if: github.event_name != 'pull_request'

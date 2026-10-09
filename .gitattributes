@@ -1,2 +1,6 @@
 # Shell scripts must keep LF endings: a CRLF shebang/script breaks bash in CI.
 *.sh text eol=lf
+# Windows scripts keep native CRLF endings.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
