@@ -17,8 +17,7 @@ defaults:
     shell: bash --noprofile --norc -CeEuo pipefail {0}
 
 jobs:
-  # Each job publishes its own package to the same "nightly" release, so they
-  # share a concurrency group to avoid racing on the release creation.
+  # Each job uploads its own package to the same "nightly" release.
   build:
     strategy:
       fail-fast: false
@@ -40,8 +39,14 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: bash build-musl.sh
 
+      # Only the targets that can run natively on the runner are executed; the
+      # aarch64 Linux build is cross-compiled and left unrun.
+      - name: Run ${{ matrix.target }}
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          ./dist/coremark
+
       - name: release
-        if: github.event_name != 'pull_request'
         uses: ncipollo/release-action@v1
         with:
           artifacts: "*.zip"
@@ -70,8 +75,43 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: ./build-msvc.ps1
 
+      - name: Run ${{ matrix.target }}
+        shell: pwsh
+        run: |
+          ./dist/coremark.exe
       - name: release
-        if: github.event_name != 'pull_request'
+        uses: ncipollo/release-action@v1
+        with:
+          artifacts: "*.zip"
+          allowUpdates: true
+          tag: "nightly"
+          name: "nightly"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit: main
+          replacesArtifacts: true
+
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+    name: build-${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # clang, lipo and zip all ship with the macOS runner.
+      - name: Build ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash build-macos.sh
+
+      - name: Run ${{ matrix.target }}
+        run: |
+          ./dist/coremark
+
+      - name: release
         uses: ncipollo/release-action@v1
         with:
           artifacts: "*.zip"
